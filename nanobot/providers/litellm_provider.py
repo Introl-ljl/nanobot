@@ -38,6 +38,7 @@ class LiteLLMProvider(LLMProvider):
         default_model: str = "anthropic/claude-opus-4-5",
         extra_headers: dict[str, str] | None = None,
         provider_name: str | None = None,
+        set_global_api_base: bool = True,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
@@ -52,7 +53,7 @@ class LiteLLMProvider(LLMProvider):
         if api_key:
             self._setup_env(api_key, api_base, default_model)
 
-        if api_base:
+        if api_base and set_global_api_base:
             litellm.api_base = api_base
 
         # Disable LiteLLM logging noise

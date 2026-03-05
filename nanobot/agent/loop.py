@@ -8,7 +8,7 @@ import re
 import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from loguru import logger
 
@@ -52,6 +52,7 @@ class AgentLoop:
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
+        archive_model: str | None = None,
         max_iterations: int = 40,
         temperature: float = 0.1,
         max_tokens: int = 4096,
@@ -65,6 +66,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        tool_timeout: int = 30,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
@@ -72,6 +74,7 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self.archive_model = archive_model
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -85,7 +88,7 @@ class AgentLoop:
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
-        self.tools = ToolRegistry()
+        self.tools = ToolRegistry(default_timeout=tool_timeout)
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -98,6 +101,7 @@ class AgentLoop:
             web_proxy=web_proxy,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            tool_timeout=tool_timeout,
         )
 
         self._running = False
@@ -106,6 +110,7 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
+        self._consolidation_counts: dict[str, int] = {}
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
@@ -362,54 +367,41 @@ class AgentLoop:
         # Slash commands
         cmd = msg.content.strip().lower()
         if cmd == "/new":
-            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
-            self._consolidating.add(session.key)
-            try:
-                async with lock:
-                    snapshot = session.messages[session.last_consolidated:]
-                    if snapshot:
-                        temp = Session(key=session.key)
-                        temp.messages = list(snapshot)
-                        if not await self._consolidate_memory(temp, archive_all=True):
-                            return OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="Memory archival failed, session not cleared. Please try again.",
-                            )
-            except Exception:
-                logger.exception("/new archival failed for {}", session.key)
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Memory archival failed, session not cleared. Please try again.",
-                )
-            finally:
-                self._consolidating.discard(session.key)
-
-            session.clear()
-            self.sessions.save(session)
+            old_session = session
+            fresh_session = Session(key=session.key)
+            self.sessions.save(fresh_session)
             self.sessions.invalidate(session.key)
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started.")
+
+            async def _archive_previous_session() -> None:
+                snapshot = old_session.messages[old_session.last_consolidated:]
+                if not snapshot:
+                    return
+                temp = Session(key=old_session.key)
+                temp.messages = list(snapshot)
+                ok = await self._consolidate_memory(temp, archive_all=True)
+                if not ok:
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="Memory archival failed for previous session snapshot.",
+                    ))
+
+            self._schedule_consolidation(session.key, _archive_previous_session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="New session started. Archiving previous context in background.",
+            )
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
-            self._consolidating.add(session.key)
-            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
+            async def _consolidate_session() -> None:
+                await self._consolidate_memory(session)
 
-            async def _consolidate_and_unlock():
-                try:
-                    async with lock:
-                        await self._consolidate_memory(session)
-                finally:
-                    self._consolidating.discard(session.key)
-                    _task = asyncio.current_task()
-                    if _task is not None:
-                        self._consolidation_tasks.discard(_task)
-
-            _task = asyncio.create_task(_consolidate_and_unlock())
-            self._consolidation_tasks.add(_task)
+            self._schedule_consolidation(session.key, _consolidate_session)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
@@ -452,6 +444,39 @@ class AgentLoop:
             metadata=msg.metadata or {},
         )
 
+    def _mark_consolidation_started(self, session_key: str) -> None:
+        self._consolidation_counts[session_key] = self._consolidation_counts.get(session_key, 0) + 1
+        self._consolidating.add(session_key)
+
+    def _mark_consolidation_finished(self, session_key: str) -> None:
+        remaining = self._consolidation_counts.get(session_key, 0) - 1
+        if remaining > 0:
+            self._consolidation_counts[session_key] = remaining
+            return
+        self._consolidation_counts.pop(session_key, None)
+        self._consolidating.discard(session_key)
+
+    def _schedule_consolidation(
+        self,
+        session_key: str,
+        job: Callable[[], Awaitable[None]],
+    ) -> None:
+        lock = self._consolidation_locks.setdefault(session_key, asyncio.Lock())
+        self._mark_consolidation_started(session_key)
+
+        async def _runner() -> None:
+            try:
+                async with lock:
+                    await job()
+            finally:
+                self._mark_consolidation_finished(session_key)
+                _task = asyncio.current_task()
+                if _task is not None:
+                    self._consolidation_tasks.discard(_task)
+
+        _task = asyncio.create_task(_runner())
+        self._consolidation_tasks.add(_task)
+
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
@@ -478,9 +503,60 @@ class AgentLoop:
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
+        # Use archive_model (fast model) if configured, otherwise fall back to main model
+        if self.archive_model:
+            from nanobot.config.loader import load_config
+            config = load_config()
+            archive_provider = self._make_archive_provider(config, self.archive_model)
+            if archive_provider:
+                return await MemoryStore(self.workspace).consolidate(
+                    session, archive_provider, self.archive_model,
+                    archive_all=archive_all, memory_window=self.memory_window,
+                )
+            logger.warning("Failed to create archive provider, falling back to main model")
+
         return await MemoryStore(self.workspace).consolidate(
             session, self.provider, self.model,
             archive_all=archive_all, memory_window=self.memory_window,
+        )
+
+    def _make_archive_provider(self, config, model: str):
+        """Create a provider for the archive model."""
+        from nanobot.providers.litellm_provider import LiteLLMProvider
+        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+        from nanobot.providers.registry import find_by_name
+
+        provider_name = config.get_provider_name(model)
+        is_bedrock_model = model.lower().startswith("bedrock/")
+
+        # Handle OpenAI Codex (special OAuth provider)
+        if provider_name == "openai_codex" or model.startswith("openai-codex/"):
+            return OpenAICodexProvider(default_model=model)
+
+        spec = find_by_name(provider_name) if provider_name else None
+
+        # GitHub Copilot: OAuth via LiteLLM (no API key needed)
+        if spec and spec.is_oauth:
+            return LiteLLMProvider(
+                api_key=None,
+                api_base=config.get_api_base(model),
+                default_model=model,
+                provider_name=provider_name,
+                set_global_api_base=False,
+            )
+
+        # Standard providers need API key
+        p = config.get_provider(model)
+        if not is_bedrock_model and not (p and p.api_key):
+            return None
+
+        return LiteLLMProvider(
+            api_key=p.api_key if p else None,
+            api_base=config.get_api_base(model),
+            default_model=model,
+            extra_headers=p.extra_headers if p else None,
+            provider_name=provider_name,
+            set_global_api_base=False,
         )
 
     async def process_direct(
