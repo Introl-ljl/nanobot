@@ -34,6 +34,10 @@ class MCPToolWrapper(Tool):
     def parameters(self) -> dict[str, Any]:
         return self._parameters
 
+    @property
+    def manages_own_timeout(self) -> bool:
+        return True
+
     async def execute(self, **kwargs: Any) -> str:
         from mcp import types
         try:

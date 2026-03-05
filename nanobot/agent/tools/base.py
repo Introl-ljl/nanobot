@@ -102,3 +102,8 @@ class Tool(ABC):
                 "parameters": self.parameters,
             },
         }
+
+    @property
+    def manages_own_timeout(self) -> bool:
+        """Whether this tool already applies its own timeout policy."""
+        return False
