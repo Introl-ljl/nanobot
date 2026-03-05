@@ -34,6 +34,7 @@ class SubagentManager:
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        tool_timeout: int = 30,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.provider = provider
@@ -47,6 +48,7 @@ class SubagentManager:
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.tool_timeout = tool_timeout
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
@@ -94,7 +96,7 @@ class SubagentManager:
 
         try:
             # Build subagent tools (no message tool, no spawn tool)
-            tools = ToolRegistry()
+            tools = ToolRegistry(default_timeout=self.tool_timeout)
             allowed_dir = self.workspace if self.restrict_to_workspace else None
             tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))

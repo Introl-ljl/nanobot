@@ -21,10 +21,41 @@ def _make_loop():
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
     return loop, bus
+
+
+def test_agent_loop_forwards_tool_timeout_to_subagent_manager():
+    """AgentLoop should pass tool_timeout through to SubagentManager."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    workspace = MagicMock()
+    workspace.__truediv__ = MagicMock(return_value=MagicMock())
+
+    with patch("nanobot.agent.loop.ContextBuilder"), \
+         patch("nanobot.agent.loop.SessionManager"), \
+         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+        AgentLoop(bus=bus, provider=provider, workspace=workspace, tool_timeout=77)
+
+    assert mock_sub_mgr.call_args.kwargs["tool_timeout"] == 77
+
+
+def test_make_archive_provider_allows_bedrock_model_without_api_key():
+    from nanobot.config.schema import Config
+
+    loop, _ = _make_loop()
+    config = Config()
+
+    provider = loop._make_archive_provider(config, "bedrock/anthropic.claude-3-5-sonnet-v2:0")
+
+    assert provider is not None
 
 
 class TestHandleStop:

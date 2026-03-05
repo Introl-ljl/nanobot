@@ -222,6 +222,7 @@ class AgentDefaults(Base):
 
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
+    archive_model: str | None = None  # Fast model for memory consolidation (e.g. "gemini/gemini-2.0-flash")
     provider: str = "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     max_tokens: int = 8192
     temperature: float = 0.1
@@ -319,6 +320,7 @@ class ToolsConfig(Base):
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
+    default_timeout: int = 30  # Default timeout in seconds for all tool executions
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 

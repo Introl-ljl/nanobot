@@ -278,6 +278,7 @@ def gateway(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
+        archive_model=config.agents.defaults.archive_model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -291,6 +292,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        tool_timeout=config.tools.default_timeout,
     )
 
     # Set cron callback (needs agent)
@@ -451,6 +453,7 @@ def agent(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
+        archive_model=config.agents.defaults.archive_model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -463,6 +466,7 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        tool_timeout=config.tools.default_timeout,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -946,6 +950,7 @@ def cron_run(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
+        archive_model=config.agents.defaults.archive_model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -957,6 +962,7 @@ def cron_run(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        tool_timeout=config.tools.default_timeout,
     )
 
     store_path = get_data_dir() / "cron" / "jobs.json"
