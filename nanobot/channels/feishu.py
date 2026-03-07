@@ -630,6 +630,7 @@ class FeishuChannel(BaseChannel):
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
+            sent_any = False
 
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
@@ -639,25 +640,35 @@ class FeishuChannel(BaseChannel):
                 if ext in self._IMAGE_EXTS:
                     key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
                     if key:
-                        await loop.run_in_executor(
+                        ok = await loop.run_in_executor(
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, "image", json.dumps({"image_key": key}, ensure_ascii=False),
                         )
+                        sent_any = sent_any or ok
                 else:
                     key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
                     if key:
                         media_type = "audio" if ext in self._AUDIO_EXTS else "file"
-                        await loop.run_in_executor(
+                        ok = await loop.run_in_executor(
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, media_type, json.dumps({"file_key": key}, ensure_ascii=False),
                         )
+                        sent_any = sent_any or ok
 
             if msg.content and msg.content.strip():
                 card = {"config": {"wide_screen_mode": True}, "elements": self._build_card_elements(msg.content)}
-                await loop.run_in_executor(
+                ok = await loop.run_in_executor(
                     None, self._send_message_sync,
                     receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
                 )
+                sent_any = sent_any or ok
+
+            # Completion acknowledgement: add a second reaction after final reply is sent.
+            # Skip progress/tool-hint frames and allow disabling by setting done_react_emoji to empty.
+            done_emoji = (self.config.done_react_emoji or "").strip()
+            source_msg_id = msg.metadata.get("message_id")
+            if sent_any and source_msg_id and not msg.metadata.get("_progress") and done_emoji:
+                await self._add_reaction(str(source_msg_id), done_emoji)
 
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)

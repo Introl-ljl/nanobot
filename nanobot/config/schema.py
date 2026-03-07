@@ -43,6 +43,7 @@ class FeishuConfig(Base):
     verification_token: str = ""  # Verification Token for event subscription (optional)
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
     react_emoji: str = "THUMBSUP"  # Emoji type for message reactions (e.g. THUMBSUP, OK, DONE, SMILE)
+    done_react_emoji: str = "DONE"  # Emoji type for completion reaction; empty to disable
 
 
 class DingTalkConfig(Base):
