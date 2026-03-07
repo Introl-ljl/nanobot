@@ -27,6 +27,35 @@ def _make_loop():
     return loop, bus
 
 
+def _make_configured_loop(tmp_path, models: list[str] | None = None):
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.config.schema import Config
+    from nanobot.session.manager import SessionManager
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "anthropic/claude-opus-4-5"
+    config = Config()
+    config.agents.defaults.model = "anthropic/claude-opus-4-5"
+    config.agents.defaults.available_models = models or ["openai/gpt-4.1"]
+    config.providers.anthropic.api_key = "anthropic-key"
+    config.providers.openai.api_key = "openai-key"
+
+    with patch("nanobot.agent.loop.load_config", return_value=config), \
+         patch("nanobot.agent.loop.ContextBuilder"), \
+         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=tmp_path,
+            model=config.agents.defaults.model,
+            session_manager=SessionManager(tmp_path),
+        )
+    return loop, bus, config
+
+
 def test_agent_loop_forwards_tool_timeout_to_subagent_manager():
     """AgentLoop should pass tool_timeout through to SubagentManager."""
     from nanobot.agent.loop import AgentLoop
@@ -155,6 +184,71 @@ class TestDispatch:
         t2 = asyncio.create_task(loop._dispatch(msg2))
         await asyncio.gather(t1, t2)
         assert order == ["start-a", "end-a", "start-b", "end-b"]
+
+
+class TestModelCommand:
+    @pytest.mark.asyncio
+    async def test_model_lists_current_and_available(self, tmp_path):
+        from nanobot.bus.events import InboundMessage
+
+        loop, _, _ = _make_configured_loop(tmp_path, models=["openai/gpt-4.1", "deepseek/deepseek-chat"])
+
+        msg = InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="/model")
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert "Current model: anthropic/claude-opus-4-5" in response.content
+        assert "openai/gpt-4.1" in response.content
+        assert "deepseek/deepseek-chat" in response.content
+
+    @pytest.mark.asyncio
+    async def test_model_switches_session_metadata(self, tmp_path):
+        from nanobot.bus.events import InboundMessage
+
+        loop, _, _ = _make_configured_loop(tmp_path)
+
+        msg = InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="/model openai/gpt-4.1")
+        response = await loop._process_message(msg)
+        session = loop.sessions.get_or_create("cli:c1")
+
+        assert response is not None
+        assert "Switched model to openai/gpt-4.1" in response.content
+        assert session.metadata["model"] == "openai/gpt-4.1"
+
+    @pytest.mark.asyncio
+    async def test_model_rejects_unconfigured_target(self, tmp_path):
+        from nanobot.bus.events import InboundMessage
+
+        loop, _, _ = _make_configured_loop(tmp_path)
+
+        msg = InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="/model gemini/gemini-2.0-flash")
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert "Model not configured" in response.content
+
+    @pytest.mark.asyncio
+    async def test_session_model_used_for_provider_calls(self, tmp_path):
+        from nanobot.bus.events import InboundMessage
+        from nanobot.providers.base import LLMResponse
+
+        loop, _, config = _make_configured_loop(tmp_path)
+        session = loop.sessions.get_or_create("cli:c1")
+        session.metadata["model"] = "openai/gpt-4.1"
+
+        provider = MagicMock()
+        provider.chat = AsyncMock(return_value=LLMResponse(content="ok", tool_calls=[]))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        with patch("nanobot.agent.loop.create_provider", return_value=provider) as mock_create_provider:
+            msg = InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="hello")
+            response = await loop._process_message(msg)
+
+        assert response is not None
+        assert response.content == "ok"
+        mock_create_provider.assert_called_with(config, "openai/gpt-4.1")
+        provider.chat.assert_awaited()
+        assert provider.chat.await_args.kwargs["model"] == "openai/gpt-4.1"
 
 
 class TestSubagentCancellation:

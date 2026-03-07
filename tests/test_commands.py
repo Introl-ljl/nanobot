@@ -3,10 +3,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import litellm
 from typer.testing import CliRunner
 
 from nanobot.cli.commands import app
 from nanobot.config.schema import Config
+from nanobot.providers.factory import create_provider
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_model
@@ -128,3 +130,31 @@ def test_litellm_provider_canonicalizes_github_copilot_hyphen_prefix():
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.1-codex") == "gpt-5.1-codex"
     assert _strip_model_prefix("openai_codex/gpt-5.1-codex") == "gpt-5.1-codex"
+
+
+def test_config_get_available_models_includes_default_and_deduplicates():
+    config = Config()
+    config.agents.defaults.model = "anthropic/claude-opus-4-5"
+    config.agents.defaults.available_models = [
+        "openai/gpt-4.1",
+        "anthropic/claude-opus-4-5",
+        "openai/gpt-4.1",
+    ]
+
+    assert config.get_available_models() == [
+        "anthropic/claude-opus-4-5",
+        "openai/gpt-4.1",
+    ]
+
+
+def test_create_provider_does_not_mutate_global_litellm_api_base() -> None:
+    config = Config()
+    config.agents.defaults.model = "openai/gpt-4.1"
+    config.providers.openai.api_key = "test-key"
+    config.providers.openai.api_base = "https://proxy.example/v1"
+    litellm.api_base = "https://original.example/v1"
+
+    provider = create_provider(config)
+
+    assert provider.api_base == "https://proxy.example/v1"
+    assert litellm.api_base == "https://original.example/v1"

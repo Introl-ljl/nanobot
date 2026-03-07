@@ -9,7 +9,6 @@ from typing import Any, AsyncGenerator
 
 import httpx
 from loguru import logger
-from oauth_cli_kit import get_token as get_codex_token
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
@@ -35,6 +34,14 @@ class OpenAICodexProvider(LLMProvider):
     ) -> LLMResponse:
         model = model or self.default_model
         system_prompt, input_items = _convert_messages(messages)
+
+        try:
+            from oauth_cli_kit import get_token as get_codex_token
+        except ImportError as exc:
+            return LLMResponse(
+                content=f"Error calling Codex: missing dependency oauth_cli_kit ({exc})",
+                finish_reason="error",
+            )
 
         token = await asyncio.to_thread(get_codex_token)
         headers = _build_headers(token.account_id, token.access)

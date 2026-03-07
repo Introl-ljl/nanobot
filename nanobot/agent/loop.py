@@ -8,7 +8,7 @@ import re
 import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -17,6 +17,12 @@ from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.memory import (
+    MemoryGetTool,
+    MemoryIndex,
+    MemoryRetrievalConfig,
+    MemorySearchTool,
+)
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -24,11 +30,13 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.config.loader import load_config
 from nanobot.providers.base import LLMProvider
+from nanobot.providers.factory import create_provider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, MemoryToolConfig
     from nanobot.cron.service import CronService
 
 
@@ -61,6 +69,7 @@ class AgentLoop:
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
+        memory_config: MemoryToolConfig | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -71,6 +80,7 @@ class AgentLoop:
         from nanobot.config.schema import ExecToolConfig
         self.bus = bus
         self.channels_config = channels_config
+        self.config = load_config()
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
@@ -83,12 +93,16 @@ class AgentLoop:
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
+        self.memory_config = memory_config
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
 
         self.context = ContextBuilder(workspace)
+        self.memory_store = MemoryStore(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry(default_timeout=tool_timeout)
+        self._memory_search_tool: MemorySearchTool | None = None
+        self._memory_get_tool: MemoryGetTool | None = None
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -117,11 +131,79 @@ class AgentLoop:
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
 
+    def _get_session_model(self, session: Session) -> str:
+        """Return the active model for the session."""
+        model = session.metadata.get("model")
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+        if self.model:
+            return self.model
+        return self.config.agents.defaults.model
+
+    def _list_model_options(self) -> list[str]:
+        """Return selectable models from config."""
+        return self.config.get_available_models()
+
+    def _handle_model_command(self, cmd: str, session: Session, msg: InboundMessage) -> OutboundMessage:
+        """Handle `/model` listing and switching."""
+        available_models = self._list_model_options()
+        current_model = self._get_session_model(session)
+        parts = msg.content.strip().split(maxsplit=1)
+
+        if len(parts) == 1:
+            options = "\n".join(
+                f"{'•' if model != current_model else '✓'} {model}"
+                for model in available_models
+            ) or "(no models configured)"
+            content = (
+                f"Current model: {current_model}\n\n"
+                "Available models:\n"
+                f"{options}\n\n"
+                "Use `/model <name>` to switch."
+            )
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
+
+        target_model = parts[1].strip()
+        if not self.config.is_configured_model(target_model):
+            content = (
+                f"Model not configured: {target_model}\n"
+                "Use `/model` to view the configured model list."
+            )
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
+
+        try:
+            create_provider(self.config, target_model)
+        except ValueError as exc:
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=str(exc))
+
+        session.metadata["model"] = target_model
+        provider_name = self.config.get_provider_name(target_model) or "auto"
+        content = f"Switched model to {target_model} (provider: {provider_name})."
+        self._save_direct_turn(session, msg.content, content)
+        self.sessions.save(session)
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+        memory_cfg = MemoryRetrievalConfig.from_obj(self.memory_config)
+        if memory_cfg.enabled:
+            try:
+                index = MemoryIndex(workspace=self.workspace, cfg=memory_cfg)
+                self._memory_get_tool = MemoryGetTool(workspace=self.workspace, cfg=memory_cfg, index=index)
+                self.tools.register(self._memory_get_tool)
+                self._memory_search_tool = MemorySearchTool(
+                    workspace=self.workspace,
+                    cfg=memory_cfg,
+                    index=index,
+                )
+                self.tools.register(self._memory_search_tool)
+                if not memory_cfg.embedding_model.strip():
+                    logger.info("memory_search using keyword fallback: tools.memory.embedding_model is not configured")
+            except Exception as e:
+                logger.warning("Memory retrieval tools disabled: {}", e)
         self.tools.register(ExecTool(
             working_dir=str(self.workspace),
             timeout=self.exec_config.timeout,
@@ -185,6 +267,9 @@ class AgentLoop:
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
+        *,
+        provider: LLMProvider | None = None,
+        model: str | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
@@ -196,10 +281,13 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
-            response = await self.provider.chat(
+            active_provider = provider or self.provider
+            active_model = model or self.model
+
+            response = await active_provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
-                model=self.model,
+                model=active_model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
@@ -347,12 +435,20 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            active_model = self._get_session_model(session)
+            active_provider = self.provider
+            if active_model != self.model:
+                active_provider = create_provider(self.config, active_model)
             history = session.get_history(max_messages=self.memory_window)
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs = await self._run_agent_loop(
+                messages,
+                provider=active_provider,
+                model=active_model,
+            )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -363,6 +459,8 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
+        if self._memory_search_tool:
+            await self._memory_search_tool.maybe_sync(force=False)
 
         # Slash commands
         cmd = msg.content.strip().lower()
@@ -394,7 +492,21 @@ class AgentLoop:
             )
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/model — Show or switch models\n/stop — Stop the current task\n/help — Show available commands")
+        if cmd == "/model" or cmd.startswith("/model "):
+            return self._handle_model_command(cmd, session, msg)
+
+        pending = session.metadata.get("pending_memory_capture")
+        if isinstance(pending, dict):
+            pending_result = self._handle_pending_memory_capture(msg, session, pending)
+            if pending_result is not None:
+                self.sessions.save(session)
+                return pending_result
+
+        remember_result = self._handle_immediate_memory_capture(msg, session)
+        if remember_result is not None:
+            self.sessions.save(session)
+            return remember_result
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
@@ -407,6 +519,13 @@ class AgentLoop:
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
+
+        active_model = self._get_session_model(session)
+        active_provider = self.provider
+        if active_model != self.model:
+            active_provider = create_provider(self.config, active_model)
+        self.subagents.provider = active_provider
+        self.subagents.model = active_model
 
         history = session.get_history(max_messages=self.memory_window)
         initial_messages = self.context.build_messages(
@@ -425,7 +544,10 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            provider=active_provider,
+            model=active_model,
+            on_progress=on_progress or _bus_progress,
         )
 
         if final_content is None:
@@ -509,55 +631,132 @@ class AgentLoop:
             config = load_config()
             archive_provider = self._make_archive_provider(config, self.archive_model)
             if archive_provider:
-                return await MemoryStore(self.workspace).consolidate(
+                ok = await self.memory_store.consolidate(
                     session, archive_provider, self.archive_model,
                     archive_all=archive_all, memory_window=self.memory_window,
                 )
+                if ok and self._memory_search_tool:
+                    await self._memory_search_tool.maybe_sync(force=False)
+                return ok
             logger.warning("Failed to create archive provider, falling back to main model")
 
-        return await MemoryStore(self.workspace).consolidate(
+        ok = await self.memory_store.consolidate(
             session, self.provider, self.model,
             archive_all=archive_all, memory_window=self.memory_window,
         )
+        if ok and self._memory_search_tool:
+            await self._memory_search_tool.maybe_sync(force=False)
+        return ok
+
+    @staticmethod
+    def _looks_like_memory_intent(text: str) -> bool:
+        lowered = text.lower()
+        patterns = [
+            "记住这个", "记住：", "记住:", "记一下", "记下来", "帮我记住",
+            "remember this", "remember:", "save this memory",
+        ]
+        return any(p in lowered for p in patterns)
+
+    @staticmethod
+    def _extract_memory_payload(text: str) -> str:
+        trimmed = text.strip()
+        splitters = [
+            "记住这个：", "记住这个:", "记住：", "记住:", "remember this:", "remember:",
+        ]
+        lowered = trimmed.lower()
+        for splitter in splitters:
+            pos = lowered.find(splitter.lower())
+            if pos >= 0:
+                payload = trimmed[pos + len(splitter):].strip()
+                if payload:
+                    return payload
+        return trimmed
+
+    @staticmethod
+    def _parse_memory_confirmation(text: str) -> str | None:
+        lowered = text.strip().lower()
+        if lowered in {"取消", "算了", "cancel", "no"}:
+            return "cancel"
+        long_answers = {"长期", "long", "long-term", "long term", "长期记忆", "1"}
+        daily_answers = {"今天", "当日", "daily", "today", "短期", "2"}
+        if lowered in long_answers:
+            return "long_term"
+        if lowered in daily_answers:
+            return "daily"
+        return None
+
+    def _save_direct_turn(self, session: Session, user_text: str, assistant_text: str) -> None:
+        session.add_message("user", user_text)
+        session.add_message("assistant", assistant_text)
+
+    def _handle_pending_memory_capture(
+        self,
+        msg: InboundMessage,
+        session: Session,
+        pending: dict[str, Any],
+    ) -> OutboundMessage | None:
+        choice = self._parse_memory_confirmation(msg.content)
+        if choice == "cancel":
+            session.metadata.pop("pending_memory_capture", None)
+            content = "Memory save canceled."
+            self._save_direct_turn(session, msg.content, content)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
+        if choice in {"long_term", "daily"}:
+            payload = str(pending.get("text", "")).strip()
+            if not payload:
+                session.metadata.pop("pending_memory_capture", None)
+                content = "Nothing to save."
+                self._save_direct_turn(session, msg.content, content)
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
+            path = self.memory_store.save_immediate_memory(payload, target=choice)
+            session.metadata.pop("pending_memory_capture", None)
+            content = f"Saved to {path.relative_to(self.workspace)}."
+            self._save_direct_turn(session, msg.content, content)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
+        if len(msg.content.strip()) <= 20:
+            ask = "请确认写入位置：回复 `长期` 或 `今天`，或回复 `取消`。"
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=ask)
+        session.metadata.pop("pending_memory_capture", None)
+        return None
+
+    def _handle_immediate_memory_capture(
+        self,
+        msg: InboundMessage,
+        session: Session,
+    ) -> OutboundMessage | None:
+        if not self._looks_like_memory_intent(msg.content):
+            return None
+        payload = self._extract_memory_payload(msg.content)
+        if not payload:
+            content = "请提供要记住的内容。"
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
+
+        target, confidence = MemoryStore.classify_target(payload)
+        if confidence < 0.7:
+            session.metadata["pending_memory_capture"] = {"text": payload, "suggested": target}
+            ask = (
+                "我识别到你想让我记住这条信息。"
+                "请确认写入位置：回复 `长期`（写入 MEMORY.md）或 `今天`（写入当日文件）。"
+            )
+            self._save_direct_turn(session, msg.content, ask)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=ask)
+
+        path = self.memory_store.save_immediate_memory(payload, target=target)
+        content = f"Saved to {path.relative_to(self.workspace)}."
+        self._save_direct_turn(session, msg.content, content)
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
 
     def _make_archive_provider(self, config, model: str):
         """Create a provider for the archive model."""
-        from nanobot.providers.litellm_provider import LiteLLMProvider
-        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-        from nanobot.providers.registry import find_by_name
-
-        provider_name = config.get_provider_name(model)
-        is_bedrock_model = model.lower().startswith("bedrock/")
-
-        # Handle OpenAI Codex (special OAuth provider)
-        if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-            return OpenAICodexProvider(default_model=model)
-
-        spec = find_by_name(provider_name) if provider_name else None
-
-        # GitHub Copilot: OAuth via LiteLLM (no API key needed)
-        if spec and spec.is_oauth:
-            return LiteLLMProvider(
-                api_key=None,
-                api_base=config.get_api_base(model),
-                default_model=model,
-                provider_name=provider_name,
+        try:
+            return create_provider(
+                config,
+                model,
                 set_global_api_base=False,
+                allow_missing_standard_credentials=True,
             )
-
-        # Standard providers need API key
-        p = config.get_provider(model)
-        if not is_bedrock_model and not (p and p.api_key):
+        except ValueError:
             return None
-
-        return LiteLLMProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-            provider_name=provider_name,
-            set_global_api_base=False,
-        )
 
     async def process_direct(
         self,
@@ -571,4 +770,14 @@ class AgentLoop:
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        return response.content if response else ""
+
+    async def process_inbound(
+        self,
+        msg: InboundMessage,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> str:
+        """Process a fully formed inbound message and return final content."""
+        await self._connect_mcp()
+        response = await self._process_message(msg, session_key=msg.session_key, on_progress=on_progress)
         return response.content if response else ""

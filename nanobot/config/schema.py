@@ -178,28 +178,57 @@ class SlackConfig(Base):
     dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
 
 
+class QQSTTConfig(Base):
+    """Speech-to-text configuration for QQ voice attachments."""
+
+    enabled: bool = False
+    provider: str = "openai"
+    model: str = "whisper-1"
+    base_url: str = ""
+    api_key: str = ""
+
+
+class QQTTSConfig(Base):
+    """Text-to-speech configuration for QQ outbound voice replies."""
+
+    enabled: bool = False
+    provider: str = "openai"
+    model: str = ""
+    voice: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    response_format: str = "mp3"
+
+
+class QQAudioFormatPolicy(Base):
+    """Audio conversion policy for inbound/outbound QQ media."""
+
+    stt_direct_formats: list[str] = Field(default_factory=list)
+    upload_direct_formats: list[str] = Field(
+        default_factory=lambda: [".wav", ".mp3", ".silk"]
+    )
+
+
 class QQConfig(Base):
-    """QQ channel configuration using botpy SDK."""
+    """QQ channel configuration using the official QQ Bot API."""
 
     enabled: bool = False
     app_id: str = ""  # 机器人 ID (AppID) from q.qq.com
     secret: str = ""  # 机器人密钥 (AppSecret) from q.qq.com
-    allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public access)
-
-class MatrixConfig(Base):
-    """Matrix (Element) channel configuration."""
-    enabled: bool = False
-    homeserver: str = "https://matrix.org"
-    access_token: str = ""
-    user_id: str = ""                       # e.g. @bot:matrix.org
-    device_id: str = ""
-    e2ee_enabled: bool = True               # end-to-end encryption support
-    sync_stop_grace_seconds: int = 2        # graceful sync_forever shutdown timeout
-    max_media_bytes: int = 20 * 1024 * 1024 # inbound + outbound attachment limit
+    client_secret_file: str = ""  # Optional file path containing AppSecret
     allow_from: list[str] = Field(default_factory=list)
-    group_policy: Literal["open", "mention", "allowlist"] = "open"
+    enabled_scenes: list[Literal["c2c", "group", "channel", "dm"]] = Field(
+        default_factory=lambda: ["c2c", "group", "channel", "dm"]
+    )
+    dm_policy: Literal["open", "pairing", "allowlist"] = "open"
+    markdown_support: bool = True
+    image_server_base_url: str = ""
+    group_policy: Literal["open", "mention", "allowlist"] = "mention"
     group_allow_from: list[str] = Field(default_factory=list)
-    allow_room_mentions: bool = False
+    react_to_mentions_only: bool = True
+    stt: QQSTTConfig = Field(default_factory=QQSTTConfig)
+    tts: QQTTSConfig = Field(default_factory=QQTTSConfig)
+    audio_format_policy: QQAudioFormatPolicy = Field(default_factory=QQAudioFormatPolicy)
 
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
@@ -223,6 +252,7 @@ class AgentDefaults(Base):
 
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
+    available_models: list[str] = Field(default_factory=list)  # Models selectable via /model
     archive_model: str | None = None  # Fast model for memory consolidation (e.g. "gemini/gemini-2.0-flash")
     provider: str = "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     max_tokens: int = 8192
@@ -304,6 +334,22 @@ class ExecToolConfig(Base):
     path_append: str = ""
 
 
+class MemoryToolConfig(Base):
+    """Memory retrieval and indexing configuration."""
+
+    enabled: bool = True
+    search_paths: list[str] = Field(default_factory=lambda: ["memory/MEMORY.md", "memory/**/*.md"])
+    extra_paths: list[str] = Field(default_factory=list)
+    index_db_path: str = "memory/.memory_index.sqlite3"
+    embedding_model: str = ""
+    embedding_provider: str | None = None
+    top_k: int = 8
+    chunk_size_chars: int = 1000
+    chunk_overlap_chars: int = 150
+    sync_debounce_ms: int = 1200
+    max_context_lines: int = 80
+
+
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -320,6 +366,7 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    memory: MemoryToolConfig = Field(default_factory=MemoryToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     default_timeout: int = 30  # Default timeout in seconds for all tool executions
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
@@ -338,6 +385,20 @@ class Config(BaseSettings):
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
         return Path(self.agents.defaults.workspace).expanduser()
+
+    def get_available_models(self) -> list[str]:
+        """Return configured model options, always including the default model."""
+        models = [self.agents.defaults.model, *self.agents.defaults.available_models]
+        out: list[str] = []
+        for model in models:
+            normalized = model.strip()
+            if normalized and normalized not in out:
+                out.append(normalized)
+        return out
+
+    def is_configured_model(self, model: str) -> bool:
+        """Return True when the model is available for runtime switching."""
+        return model.strip() in self.get_available_models()
 
     def _match_provider(self, model: str | None = None) -> tuple["ProviderConfig | None", str | None]:
         """Match provider config and its registry name. Returns (config, spec_name)."""

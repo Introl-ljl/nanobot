@@ -64,9 +64,11 @@ class SubagentManager:
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
+        provider = self.provider
+        model = self.model
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent(task_id, task, display_label, origin, provider=provider, model=model)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -90,6 +92,9 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        *,
+        provider: LLMProvider,
+        model: str,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -125,10 +130,10 @@ class SubagentManager:
             while iteration < max_iterations:
                 iteration += 1
 
-                response = await self.provider.chat(
+                response = await provider.chat(
                     messages=messages,
                     tools=tools.get_definitions(),
-                    model=self.model,
+                    model=model,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     reasoning_effort=self.reasoning_effort,
