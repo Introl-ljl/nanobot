@@ -1,6 +1,7 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import json
 import os
 import select
 import signal
@@ -18,6 +19,7 @@ from rich.table import Table
 from rich.text import Text
 
 from nanobot import __logo__, __version__
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.config.schema import Config
 from nanobot.utils.helpers import sync_workspace_templates
 
@@ -200,40 +202,98 @@ def onboard():
 
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config."""
-    from nanobot.providers.custom_provider import CustomProvider
-    from nanobot.providers.litellm_provider import LiteLLMProvider
-    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+    from nanobot.providers.factory import create_provider
 
-    model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
-
-    # OpenAI Codex (OAuth)
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
-
-    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    if provider_name == "custom":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-        )
-
-    from nanobot.providers.registry import find_by_name
-    spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
+    try:
+        return create_provider(config)
+    except ValueError:
         console.print("[red]Error: No API key configured.[/red]")
         console.print("Set one in ~/.nanobot/config.json under providers section")
         raise typer.Exit(1)
 
-    return LiteLLMProvider(
-        api_key=p.api_key if p else None,
-        api_base=config.get_api_base(model),
-        default_model=model,
-        extra_headers=p.extra_headers if p else None,
-        provider_name=provider_name,
+
+async def _send_channel_message_once(
+    channel_name: str,
+    chat_id: str,
+    content: str,
+    *,
+    reply_to: str | None = None,
+    media: list[str] | None = None,
+    metadata: dict | None = None,
+) -> None:
+    from nanobot.bus.queue import MessageBus
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    bus = MessageBus()
+    channel_key = channel_name.strip().lower()
+    outbound = OutboundMessage(
+        channel=channel_key,
+        chat_id=chat_id,
+        content=content,
+        reply_to=reply_to,
+        media=media or [],
+        metadata=dict(metadata or {}),
     )
+
+    channel_factories = {
+        "telegram": lambda: __import__("nanobot.channels.telegram", fromlist=["TelegramChannel"]).TelegramChannel(
+            config.channels.telegram, bus, groq_api_key=config.providers.groq.api_key,
+        ),
+        "discord": lambda: __import__("nanobot.channels.discord", fromlist=["DiscordChannel"]).DiscordChannel(
+            config.channels.discord, bus,
+        ),
+        "email": lambda: __import__("nanobot.channels.email", fromlist=["EmailChannel"]).EmailChannel(
+            config.channels.email, bus,
+        ),
+        "feishu": lambda: __import__("nanobot.channels.feishu", fromlist=["FeishuChannel"]).FeishuChannel(
+            config.channels.feishu, bus,
+        ),
+        "mochat": lambda: __import__("nanobot.channels.mochat", fromlist=["MochatChannel"]).MochatChannel(
+            config.channels.mochat, bus,
+        ),
+        "qq": lambda: __import__("nanobot.channels.qq", fromlist=["QQChannel"]).QQChannel(
+            config.channels.qq, bus,
+        ),
+        "slack": lambda: __import__("nanobot.channels.slack", fromlist=["SlackChannel"]).SlackChannel(
+            config.channels.slack, bus,
+        ),
+        "dingtalk": lambda: __import__("nanobot.channels.dingtalk", fromlist=["DingTalkChannel"]).DingTalkChannel(
+            config.channels.dingtalk, bus,
+        ),
+    }
+
+    if channel_key not in channel_factories:
+        raise ValueError(f"Unsupported channel for one-shot send: {channel_name}")
+
+    channel = channel_factories[channel_key]()
+
+    async def _send_via_start_stop() -> None:
+        start_task = asyncio.create_task(channel.start())
+        try:
+            await asyncio.sleep(1.5)
+            await channel.send(outbound)
+        finally:
+            await channel.stop()
+            start_task.cancel()
+            await asyncio.gather(start_task, return_exceptions=True)
+
+    async def _send_via_sender_only() -> None:
+        await channel.start_sender_only()
+        try:
+            await channel.send(outbound)
+        finally:
+            await channel.stop()
+
+    if channel_key == "telegram":
+        await _send_via_sender_only()
+        return
+
+    if channel_key in {"discord", "slack", "qq", "feishu"}:
+        await _send_via_start_stop()
+        return
+
+    await channel.send(outbound)
 
 
 # ============================================================================
@@ -287,6 +347,7 @@ def gateway(
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
+        memory_config=config.tools.memory,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
@@ -462,6 +523,7 @@ def agent(
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
+        memory_config=config.tools.memory,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
@@ -589,6 +651,127 @@ def agent(
                 await agent_loop.close_mcp()
 
         asyncio.run(run_interactive())
+
+
+hooks_app = typer.Typer(help="Hook helpers for external automation")
+app.add_typer(hooks_app, name="hooks")
+
+
+@hooks_app.command("notify")
+def hooks_notify(
+    channel: str = typer.Option(..., "--channel", help="Target channel name"),
+    chat_id: str = typer.Option(..., "--chat-id", help="Target chat/user ID"),
+    message: str = typer.Option(..., "--message", help="Message to send"),
+    reply_to: str | None = typer.Option(None, "--reply-to", help="Optional reply target/message ID"),
+    media: list[str] = typer.Option(None, "--media", help="Optional attachment paths"),
+    metadata_json: str | None = typer.Option(None, "--metadata-json", help="Optional JSON object metadata"),
+):
+    """Send a single outbound message through a configured channel."""
+    metadata: dict | None = None
+    if metadata_json:
+        try:
+            parsed = json.loads(metadata_json)
+        except json.JSONDecodeError as exc:
+            console.print(f"[red]Invalid --metadata-json: {exc}[/red]")
+            raise typer.Exit(1) from exc
+        if not isinstance(parsed, dict):
+            console.print("[red]--metadata-json must be a JSON object[/red]")
+            raise typer.Exit(1)
+        metadata = parsed
+
+    try:
+        asyncio.run(_send_channel_message_once(
+            channel_name=channel,
+            chat_id=chat_id,
+            content=message,
+            reply_to=reply_to,
+            media=media,
+            metadata=metadata,
+        ))
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    console.print(f"[green]✓[/green] Sent to {channel}:{chat_id}")
+
+
+@hooks_app.command("inject")
+def hooks_inject(
+    channel: str = typer.Option(..., "--channel", help="Origin channel name"),
+    chat_id: str = typer.Option(..., "--chat-id", help="Origin chat/user ID"),
+    message: str = typer.Option(..., "--message", help="Inbound message content"),
+    sender_id: str = typer.Option("hook", "--sender-id", help="Inbound sender identifier"),
+    session_key: str | None = typer.Option(None, "--session-key", help="Optional session override"),
+    system: bool = typer.Option(False, "--system", help="Treat input as a system-originated message"),
+    media: list[str] = typer.Option(None, "--media", help="Optional media paths"),
+    metadata_json: str | None = typer.Option(None, "--metadata-json", help="Optional JSON object metadata"),
+    markdown: bool = typer.Option(False, "--markdown/--no-markdown", help="Render response as Markdown"),
+):
+    """Inject a single inbound message into nanobot and print the result."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.config.loader import get_data_dir, load_config
+    from nanobot.cron.service import CronService
+
+    metadata: dict = {}
+    if metadata_json:
+        try:
+            parsed = json.loads(metadata_json)
+        except json.JSONDecodeError as exc:
+            console.print(f"[red]Invalid --metadata-json: {exc}[/red]")
+            raise typer.Exit(1) from exc
+        if not isinstance(parsed, dict):
+            console.print("[red]--metadata-json must be a JSON object[/red]")
+            raise typer.Exit(1)
+        metadata = parsed
+
+    config = load_config()
+    sync_workspace_templates(config.workspace_path)
+    bus = MessageBus()
+    provider = _make_provider(config)
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    cron = CronService(cron_store_path)
+    agent_loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=config.workspace_path,
+        model=config.agents.defaults.model,
+        archive_model=config.agents.defaults.archive_model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        memory_window=config.agents.defaults.memory_window,
+        reasoning_effort=config.agents.defaults.reasoning_effort,
+        brave_api_key=config.tools.web.search.api_key or None,
+        web_proxy=config.tools.web.proxy or None,
+        exec_config=config.tools.exec,
+        memory_config=config.tools.memory,
+        cron_service=cron,
+        restrict_to_workspace=config.tools.restrict_to_workspace,
+        mcp_servers=config.tools.mcp_servers,
+        channels_config=config.channels,
+        tool_timeout=config.tools.default_timeout,
+    )
+
+    inbound = InboundMessage(
+        channel="system" if system else channel,
+        sender_id=sender_id,
+        chat_id=f"{channel}:{chat_id}" if system else chat_id,
+        content=message,
+        media=media or [],
+        metadata=metadata,
+        session_key_override=session_key,
+    )
+
+    async def run_once() -> str:
+        try:
+            return await agent_loop.process_inbound(inbound)
+        finally:
+            await agent_loop.close_mcp()
+
+    response = asyncio.run(run_once())
+    if response:
+        _print_agent_response(response, render_markdown=markdown)
 
 
 # ============================================================================
@@ -959,6 +1142,7 @@ def cron_run(
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
+        memory_config=config.tools.memory,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
@@ -1016,6 +1200,9 @@ def status():
         from nanobot.providers.registry import PROVIDERS
 
         console.print(f"Model: {config.agents.defaults.model}")
+        available_models = config.get_available_models()
+        if available_models:
+            console.print(f"Available models: {', '.join(available_models)}")
 
         # Check API keys from registry
         for spec in PROVIDERS:

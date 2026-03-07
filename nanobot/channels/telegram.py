@@ -112,6 +112,7 @@ class TelegramChannel(BaseChannel):
     BOT_COMMANDS = [
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
+        BotCommand("model", "Show or switch models"),
         BotCommand("stop", "Stop the current task"),
         BotCommand("help", "Show available commands"),
     ]
@@ -130,6 +131,29 @@ class TelegramChannel(BaseChannel):
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
+        self._polling_started = False
+
+    def _build_application(self) -> Application:
+        """Build a Telegram application instance for sending or polling."""
+        req = HTTPXRequest(connection_pool_size=16, pool_timeout=5.0, connect_timeout=30.0, read_timeout=30.0)
+        builder = Application.builder().token(self.config.token).request(req).get_updates_request(req)
+        if self.config.proxy:
+            builder = builder.proxy(self.config.proxy).get_updates_proxy(self.config.proxy)
+        app = builder.build()
+        app.add_error_handler(self._on_error)
+        return app
+
+    async def start_sender_only(self) -> None:
+        """Initialize Telegram for outbound sending without starting polling."""
+        if not self.config.token:
+            logger.error("Telegram bot token not configured")
+            return
+
+        self._running = True
+        self._app = self._build_application()
+        self._polling_started = False
+        await self._app.initialize()
+        await self._app.start()
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -139,17 +163,12 @@ class TelegramChannel(BaseChannel):
 
         self._running = True
 
-        # Build the application with larger connection pool to avoid pool-timeout on long runs
-        req = HTTPXRequest(connection_pool_size=16, pool_timeout=5.0, connect_timeout=30.0, read_timeout=30.0)
-        builder = Application.builder().token(self.config.token).request(req).get_updates_request(req)
-        if self.config.proxy:
-            builder = builder.proxy(self.config.proxy).get_updates_proxy(self.config.proxy)
-        self._app = builder.build()
-        self._app.add_error_handler(self._on_error)
+        self._app = self._build_application()
 
         # Add command handlers
         self._app.add_handler(CommandHandler("start", self._on_start))
         self._app.add_handler(CommandHandler("new", self._forward_command))
+        self._app.add_handler(CommandHandler("model", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
 
         # Add message handler for text, photos, voice, documents
@@ -182,6 +201,7 @@ class TelegramChannel(BaseChannel):
             allowed_updates=["message"],
             drop_pending_updates=True  # Ignore old messages on startup
         )
+        self._polling_started = True
 
         # Keep running until stopped
         while self._running:
@@ -202,10 +222,12 @@ class TelegramChannel(BaseChannel):
 
         if self._app:
             logger.info("Stopping Telegram bot...")
-            await self._app.updater.stop()
+            if self._polling_started:
+                await self._app.updater.stop()
             await self._app.stop()
             await self._app.shutdown()
             self._app = None
+            self._polling_started = False
 
     @staticmethod
     def _get_media_type(path: str) -> str:
@@ -308,6 +330,7 @@ class TelegramChannel(BaseChannel):
         await update.message.reply_text(
             "🐈 nanobot commands:\n"
             "/new — Start a new conversation\n"
+            "/model — Show or switch models\n"
             "/stop — Stop the current task\n"
             "/help — Show available commands"
         )
