@@ -6,6 +6,7 @@ tool call response, it should serialize them to JSON instead of raising TypeErro
 """
 
 import json
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -26,7 +27,7 @@ def _make_session(message_count: int = 30, memory_window: int = 50):
     return session
 
 
-def _make_tool_response(history_entry, memory_update):
+def _make_tool_response(daily_entries, memory_update):
     """Create an LLMResponse with a save_memory tool call."""
     return LLMResponse(
         content=None,
@@ -35,7 +36,7 @@ def _make_tool_response(history_entry, memory_update):
                 id="call_1",
                 name="save_memory",
                 arguments={
-                    "history_entry": history_entry,
+                    "daily_entries": daily_entries,
                     "memory_update": memory_update,
                 },
             )
@@ -53,7 +54,7 @@ class TestMemoryConsolidationTypeHandling:
         provider = AsyncMock()
         provider.chat = AsyncMock(
             return_value=_make_tool_response(
-                history_entry="[2026-01-01] User discussed testing.",
+                daily_entries=["[2026-01-01] User discussed testing."],
                 memory_update="# Memory\nUser likes testing.",
             )
         )
@@ -62,18 +63,19 @@ class TestMemoryConsolidationTypeHandling:
         result = await store.consolidate(session, provider, "test-model", memory_window=50)
 
         assert result is True
-        assert store.history_file.exists()
-        assert "[2026-01-01] User discussed testing." in store.history_file.read_text()
+        today_file = store.daily_file_for(datetime.now().strftime("%Y-%m-%d"))
+        assert today_file.exists()
+        assert "User discussed testing." in today_file.read_text()
         assert "User likes testing." in store.memory_file.read_text()
 
     @pytest.mark.asyncio
     async def test_dict_arguments_serialized_to_json(self, tmp_path: Path) -> None:
-        """Issue #1042: LLM returns dict instead of string — must not raise TypeError."""
+        """Issue #1042: LLM returns dict/list values — must not raise TypeError."""
         store = MemoryStore(tmp_path)
         provider = AsyncMock()
         provider.chat = AsyncMock(
             return_value=_make_tool_response(
-                history_entry={"timestamp": "2026-01-01", "summary": "User discussed testing."},
+                daily_entries=[{"timestamp": "2026-01-01", "summary": "User discussed testing."}],
                 memory_update={"facts": ["User likes testing"], "topics": ["testing"]},
             )
         )
@@ -82,9 +84,10 @@ class TestMemoryConsolidationTypeHandling:
         result = await store.consolidate(session, provider, "test-model", memory_window=50)
 
         assert result is True
-        assert store.history_file.exists()
-        history_content = store.history_file.read_text()
-        parsed = json.loads(history_content.strip())
+        today_file = store.daily_file_for(datetime.now().strftime("%Y-%m-%d"))
+        history_content = today_file.read_text()
+        entry = history_content.strip().split("] ", 1)[1]
+        parsed = json.loads(entry)
         assert parsed["summary"] == "User discussed testing."
 
         memory_content = store.memory_file.read_text()
@@ -105,7 +108,7 @@ class TestMemoryConsolidationTypeHandling:
                     id="call_1",
                     name="save_memory",
                     arguments=json.dumps({
-                        "history_entry": "[2026-01-01] User discussed testing.",
+                        "daily_entries": ["[2026-01-01] User discussed testing."],
                         "memory_update": "# Memory\nUser likes testing.",
                     }),
                 )
@@ -117,7 +120,8 @@ class TestMemoryConsolidationTypeHandling:
         result = await store.consolidate(session, provider, "test-model", memory_window=50)
 
         assert result is True
-        assert "User discussed testing." in store.history_file.read_text()
+        today_file = store.daily_file_for(datetime.now().strftime("%Y-%m-%d"))
+        assert "User discussed testing." in today_file.read_text()
 
     @pytest.mark.asyncio
     async def test_no_tool_call_returns_false(self, tmp_path: Path) -> None:
@@ -132,7 +136,8 @@ class TestMemoryConsolidationTypeHandling:
         result = await store.consolidate(session, provider, "test-model", memory_window=50)
 
         assert result is False
-        assert not store.history_file.exists()
+        today_file = store.daily_file_for(datetime.now().strftime("%Y-%m-%d"))
+        assert not today_file.exists()
 
     @pytest.mark.asyncio
     async def test_skips_when_few_messages(self, tmp_path: Path) -> None:

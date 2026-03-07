@@ -1,6 +1,6 @@
 ---
 name: memory
-description: Two-layer memory system with grep-based recall.
+description: Two-layer memory system with semantic recall.
 always: true
 ---
 
@@ -9,15 +9,15 @@ always: true
 ## Structure
 
 - `memory/MEMORY.md` — Long-term facts (preferences, project context, relationships). Always loaded into your context.
-- `memory/HISTORY.md` — Append-only event log. NOT loaded into context. Search it with grep. Each entry starts with [YYYY-MM-DD HH:MM].
+- `memory/YYYY-MM-DD.md` — Daily process notes (what happened today, temporary decisions, troubleshooting, follow-ups).
 
 ## Search Past Events
 
 ```bash
-grep -i "keyword" memory/HISTORY.md
+memory_search(query="keyword or intent")
 ```
 
-Use the `exec` tool to run grep. Combine patterns: `grep -iE "meeting|deadline" memory/HISTORY.md`
+After `memory_search`, use `memory_get(path, line)` to verify source context before answering details.
 
 ## When to Update MEMORY.md
 
@@ -28,4 +28,4 @@ Write important facts immediately using `edit_file` or `write_file`:
 
 ## Auto-consolidation
 
-Old conversations are automatically summarized and appended to HISTORY.md when the session grows large. Long-term facts are extracted to MEMORY.md. You don't need to manage this.
+Old conversations are automatically summarized into daily files when the session grows large. Long-term facts are extracted to MEMORY.md. You don't need to manage this.

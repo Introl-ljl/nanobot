@@ -1,10 +1,11 @@
 """Test session management with cache-friendly message handling."""
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from pathlib import Path
+
 from nanobot.session.manager import Session, SessionManager
 
 # Test constants
@@ -820,3 +821,85 @@ class TestConsolidationDeduplicationGuard:
         assert response is not None
         assert "new session started" in response.content.lower()
         assert loop.sessions.get_or_create("cli:test").messages == []
+
+
+class TestImmediateMemoryCapture:
+    """Test explicit remember flow and confirmation flow."""
+
+    @pytest.mark.asyncio
+    async def test_remember_command_writes_long_term(self, tmp_path: Path) -> None:
+        from nanobot.agent.loop import AgentLoop
+        from nanobot.bus.events import InboundMessage
+        from nanobot.bus.queue import MessageBus
+        from nanobot.config.schema import MemoryToolConfig
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=tmp_path,
+            model="test-model",
+            memory_config=MemoryToolConfig(enabled=False),
+        )
+        provider.chat = AsyncMock()
+
+        msg = InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="test",
+            content="记住这个：我的偏好是简洁回复",
+        )
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert "saved to memory/memory.md" in response.content.lower()
+        memory_file = tmp_path / "memory" / "MEMORY.md"
+        assert "简洁回复" in memory_file.read_text(encoding="utf-8")
+        provider.chat.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_remember_confirmation_flow_writes_daily(self, tmp_path: Path) -> None:
+        from datetime import datetime
+
+        from nanobot.agent.loop import AgentLoop
+        from nanobot.bus.events import InboundMessage
+        from nanobot.bus.queue import MessageBus
+        from nanobot.config.schema import MemoryToolConfig
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=tmp_path,
+            model="test-model",
+            memory_config=MemoryToolConfig(enabled=False),
+        )
+        provider.chat = AsyncMock()
+
+        first = InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="test",
+            content="记住这个 修复了连接超时问题，后续要跟进",
+        )
+        ask = await loop._process_message(first)
+        assert ask is not None
+        assert "请确认写入位置" in ask.content
+
+        confirm = InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="test",
+            content="今天",
+        )
+        saved = await loop._process_message(confirm)
+        assert saved is not None
+        today = datetime.now().strftime("%Y-%m-%d")
+        assert f"memory/{today}.md" in saved.content
+        daily_file = tmp_path / "memory" / f"{today}.md"
+        assert "连接超时问题" in daily_file.read_text(encoding="utf-8")
+        provider.chat.assert_not_called()

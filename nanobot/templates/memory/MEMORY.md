@@ -21,3 +21,5 @@ This file stores important information that should persist across sessions.
 ---
 
 *This file is automatically updated by nanobot when important information should be remembered.*
+
+Daily process notes are stored separately in `memory/YYYY-MM-DD.md`.

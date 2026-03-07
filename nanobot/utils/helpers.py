@@ -58,6 +58,7 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
             _write(item, workspace / item.name)
     _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
     _write(None, workspace / "memory" / "HISTORY.md")
+    (workspace / "memory").mkdir(parents=True, exist_ok=True)
     (workspace / "skills").mkdir(exist_ok=True)
 
     if added and not silent:

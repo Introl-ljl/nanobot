@@ -68,7 +68,7 @@ You are nanobot, a helpful AI assistant.
 ## Workspace
 Your workspace is at: {workspace_path}
 - Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
+- Daily memory logs: {workspace_path}/memory/YYYY-MM-DD.md (search with memory_search; legacy HISTORY.md may still exist for compatibility)
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 ## nanobot Guidelines
