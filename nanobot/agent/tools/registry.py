@@ -53,6 +53,9 @@ class ToolRegistry:
                     + _hint
                 )
 
+            # Attempt to cast parameters to match schema types
+            params = tool.cast_params(params)
+
             tool_params = dict(params)
             tool_schema = tool.parameters if isinstance(tool.parameters, dict) else {}
             tool_properties = tool_schema.get("properties", {})
@@ -65,6 +68,7 @@ class ToolRegistry:
                 # timeout in their own schema.
                 timeout = tool_params.pop("timeout", self._default_timeout)
 
+            # Validate parameters
             errors = tool.validate_params(tool_params)
             if errors:
                 return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + _hint
